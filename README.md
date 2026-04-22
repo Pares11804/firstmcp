@@ -1,6 +1,6 @@
-# First MCP server: Oracle (read tools)
+# First MCP server: Oracle (direct SQL)
 
-This project is a **Model Context Protocol (MCP) server** written in Python. It exposes **tools** that an MCP-aware client (for example **Cursor**) can call so that the assistant can fetch **read-only** data from an **Oracle** database and answer your questions with that context.
+This project is a **Model Context Protocol (MCP) server** written in Python. It exposes a **`query` tool** that runs **arbitrary SQL** (whatever your `ORACLE_USER` may do)—no extra helper tools, no read-only filter, and no row cap in the server. Use a **suitably limited** database account; the assistant can be destructive if it issues DML/DDL.
 
 ---
 
@@ -54,9 +54,9 @@ sequenceDiagram
   participant Oracle as Oracle DB
 
   User->>Cursor: Chat: ask in natural language
-  Note over Cursor: Model may call a tool<br/>query / list_tables / describe_table
+  Note over Cursor: Model may call a tool (query)
   Cursor->>MCP: Tool invocation (name + arguments)
-  MCP->>Oracle: Run SQL (read-only, row cap)
+  MCP->>Oracle: Run SQL (as ORACLE_USER)
   Oracle-->>MCP: Result rows
   MCP-->>Cursor: Tool output (JSON text)
   Cursor-->>User: Assistant reply using results
@@ -86,18 +86,19 @@ The **Oracle** side only sees the **database account** named in `ORACLE_USER` (a
 
 | Tool | Purpose |
 |------|--------|
-| `query` | Run a **single** `SELECT` or `WITH` (CTE) query, optional named binds, max **200** rows. |
-| `list_tables` | List tables in a schema (`ALL_TABLES`), optional `LIKE` on table name. |
-| `describe_table` | Column list for a table (`ALL_TAB_COLUMNS`). |
+| `query` | One **complete** SQL (or PL/SQL) string per call; optional named `params` for binds. **No** list/describe utilities: use normal SQL, e.g. `SELECT * FROM all_tables …`. |
 
-Queries are **heuristically** restricted to read-only use (no `INSERT`/`UPDATE`/etc. in the checked string). You should still use a **least-privileged** database user; the check is not a full SQL security audit.
+- **Result sets** (`cur.description` set): the server `fetchall()`s—**no row cap**; huge queries can use a lot of memory and token budget.
+- **No result set** (DML/DDL, etc.): response includes `affected_rows` / `rowcount` where the driver provides them, then the connection is **committed** (non-`SELECT` path).
+
+There is **no** SQL type whitelist in the server. Treat the DB user and chat context as a **privileged remote SQL session**.
 
 ---
 
 ## Requirements
 
 - **Python 3.10+**
-- An Oracle database you can connect to, and a user with appropriate privileges to query the objects you need (`ALL_TABLES` / `ALL_TAB_COLUMNS` require the right visibility for those views).
+- An Oracle database you can connect to. The DB user you configure should match how much power you are willing to give the assistant (read-only is safer; full access is allowed by this code).
 
 **Driver:** this project uses [python-oracledb](https://python-oracledb.readthedocs.io/) (`oracledb` on PyPI).
 
@@ -129,7 +130,7 @@ pip install -r requirements.txt
 | `ORACLE_CLIENT_LIB_DIR` | No | Path to Instant Client for `oracledb.init_oracle_client()` if the client is not on `PATH`. |
 | `ORACLE_POOL_MAX` | No | Max pool size (default `4`). |
 
-Never commit real passwords. Prefer the client’s **MCP “env”** block or a local secret store, not a checked-in file.
+Never commit real passwords. You can keep them in a local **`.env`** in the project root (gitignored); the server runs `load_dotenv()` on startup. With **python-dotenv**, values **already in the process environment** (for example from Cursor’s MCP `env` block) are **not** replaced by `.env` unless you change that—so you can use **either** `.env` **or** MCP `env` for a given variable, with MCP usually winning if both are set in different places.
 
 ### 3. Register the server in Cursor
 
@@ -144,8 +145,8 @@ The exact file for MCP settings depends on your Cursor version (user-level MCP c
 ### 4. Use it in chat
 
 - Enable the Oracle MCP in your session.
-- Ask in natural language, for example: “List tables in schema `MYSCHEMA`” or “What columns does `MYSCHEMA.MY_TABLE` have?”
-- The assistant will call `list_tables` / `describe_table` or `query` with SQL and then summarize the JSON result.
+- Ask in natural language, or provide SQL. The model should call the **`query`** tool with the SQL (and `params` for binds) and then summarize the JSON.
+- For metadata, the model can `query` e.g. `SELECT … FROM all_tables` / `all_tab_columns` (subject to that user’s grants).
 
 If the model does not call the tool, say explicitly: “Use the Oracle MCP `query` tool to run: …”
 
@@ -153,12 +154,11 @@ If the model does not call the tool, say explicitly: “Use the Oracle MCP `quer
 
 ## How the code is organized
 
-- **`oracle_mcp_server.py`**  
-  - **`FastMCP`**: defines the app name, registers tools, runs **stdio** transport.  
-  - **`get_pool()`**: lazy singleton connection pool, thick vs thin per env.  
-  - **`_is_read_only_select()`**: lightweight guard; not a full SQL parser.  
-  - **`_run_read_query()`**: executes validated SQL, caps rows, returns JSON text.  
-  - Tool functions: thin wrappers (docstrings are shown to the model as tool help).
+- **`oracle_mcp_server.py`**
+  - **`FastMCP`**: app name, single **`query`** tool, **stdio** transport.
+  - **`get_pool()`**: lazy connection pool, thick vs thin per env.
+  - **`_run_sql()`**: `execute` → if `description`: `fetchall()` + JSON; else `commit` + `rowcount` JSON.
+  - `_cell_for_json` / `_rows_to_json`: encode values for the model.
 
 - **`requirements.txt`**: `fastmcp` and `oracledb`.
 
@@ -166,9 +166,9 @@ If the model does not call the tool, say explicitly: “Use the Oracle MCP `quer
 
 ## Security notes
 
-- Use a **read-only** or **limited** user for day-to-day assistant access if possible.
-- The `query` tool can still run any `SELECT` your user is allowed to run, including over broad views—plan grants accordingly.
-- Do not **paste secrets** into chat. Configure credentials in **environment variables** the MCP process inherits.
+- The server is effectively a **remote SQL session** for `ORACLE_USER`. Prefer a **read-only** or **least-privilege** user unless you accept DML/DDL risk from model mistakes.
+- Large **SELECT**s have **no** server-side row limit; control size in SQL (e.g. `FETCH FIRST`, `ROWNUM` / `OFFSET … FETCH` as appropriate) or the session may OOM the MCP process.
+- Do not **paste secrets** into chat. Configure credentials via **env** or **`.env`**.
 
 ---
 
@@ -179,7 +179,7 @@ If the model does not call the tool, say explicitly: “Use the Oracle MCP `quer
 | “Set ORACLE_USER…” | `ORACLE_USER` / `ORACLE_PASSWORD` / `ORACLE_DSN` missing in the **MCP** env, not just your shell. |
 | DPI / Instant Client errors | For thick mode: Instant Client **bitness** matches Python; `TNS_ADMIN` points at the folder with `tnsnames.ora`; `ORACLE_DSN` is the **alias** name. |
 | `ORA-12154` / TNS | TNS name not resolved: verify `TNS_ADMIN`, file name `tnsnames.ora`, and the alias in `ORACLE_DSN`. |
-| Permission errors on `ALL_*` views | The DB user may need to be granted access or use `USER_TABLES` / `USER_TAB_COLUMNS` for its own objects (would require a small code change to those views). |
+| Permission errors on `ALL_*` views | Grant `SELECT` on data dictionary / objects as needed, or query `user_*` views for the same user’s objects. |
 
 ---
 
